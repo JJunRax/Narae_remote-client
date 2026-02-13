@@ -1,0 +1,23 @@
+[package]
+name = "remote-client"
+version = "0.1.0"
+description = "나래소프트 원격 지원 클라이언트"
+authors = ["Naraesoft"]
+edition = "2021"
+
+[lib]
+name = "remote_client_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+enigo = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
