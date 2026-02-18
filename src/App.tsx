@@ -1,8 +1,9 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import "./App.css";
 import { db } from "./lib/firebase";
-import { collection, addDoc, onSnapshot, doc, deleteDoc, query, where, getDocs, Timestamp, updateDoc } from "firebase/firestore";
+import { collection, addDoc, onSnapshot, doc, deleteDoc, query, where, getDocs, Timestamp, updateDoc, arrayUnion } from "firebase/firestore";
 // @ts-ignore
 import SimplePeer from "simple-peer";
 import { validateCommand } from "./lib/commandValidator";
@@ -17,7 +18,7 @@ type AppStatus = "idle" | "preparing" | "waiting" | "connected" | "error" | "end
 function App() {
   const [code, setCode] = useState("");
   const [status, setStatus] = useState<AppStatus>("idle");
-  const [statusMessage, setStatusMessage] = useState("원격 지원을 시작하려면 아래 버튼을 눌러주세요.");
+  const [statusMessage, setStatusMessage] = useState("원격 지원을 준비하고 있습니다...");
   const [copied, setCopied] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const peerRef = useRef<SimplePeer.Instance | null>(null);
@@ -27,6 +28,7 @@ function App() {
   const logDocId = useRef<string | null>(null);
   const commandCounts = useRef({ mouseMovements: 0, mouseClicks: 0, keyPresses: 0 });
   const connectedAtRef = useRef<Date | null>(null);
+  const autoStarted = useRef(false);
 
   const writeEndLog = useCallback(async (endReason: string) => {
     if (!logDocId.current) return;
@@ -50,26 +52,21 @@ function App() {
   }, []);
 
   const cleanup = useCallback(async (endReason?: string) => {
-    // Write end log
     if (endReason) {
       await writeEndLog(endReason);
     }
-    // Destroy peer
     if (peerRef.current) {
       peerRef.current.destroy();
       peerRef.current = null;
     }
-    // Stop stream tracks
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(t => t.stop());
       streamRef.current = null;
     }
-    // Unsubscribe Firestore listener
     if (unsubRef.current) {
       unsubRef.current();
       unsubRef.current = null;
     }
-    // Delete Firestore session
     if (sessionDocId.current) {
       try {
         await deleteDoc(doc(db, "remote_sessions", sessionDocId.current));
@@ -90,17 +87,13 @@ function App() {
     setStatusMessage("원격 지원이 종료되었습니다.");
   }, [cleanup]);
 
-  const resetToIdle = useCallback(() => {
-    setStatus("idle");
-    setStatusMessage("원격 지원을 시작하려면 아래 버튼을 눌러주세요.");
-  }, []);
+  const startShare = useCallback(async () => {
+    if (status === "preparing" || status === "waiting" || status === "connected") return;
 
-  const startShare = async () => {
     setStatus("preparing");
     setStatusMessage("화면 공유 준비 중...");
 
     try {
-      // Optimized video constraints for better performance
       const stream = await navigator.mediaDevices.getDisplayMedia({
         video: {
           cursor: "always",
@@ -116,16 +109,18 @@ function App() {
         videoRef.current.srcObject = stream;
       }
 
-      // Create peer with optimized ICE configuration
       const peer = new SimplePeer({
         initiator: true,
-        trickle: false, // Gather all ICE candidates before signaling
+        trickle: true,
         stream: stream,
         config: ICE_CONFIG,
       });
       peerRef.current = peer;
 
-      // Set initial bitrate constraint (2.5 Mbps)
+      let answerSignaled = false;
+      let processedAnswerCandidates = 0;
+
+      // Set initial bitrate constraint
       peer.on("connect", async () => {
         try {
           const senders = (peer as any)._pc.getSenders();
@@ -135,7 +130,7 @@ function App() {
             if (!parameters.encodings) {
               parameters.encodings = [{}];
             }
-            parameters.encodings[0].maxBitrate = 2500000; // 2.5 Mbps
+            parameters.encodings[0].maxBitrate = 2500000;
             await videoSender.setParameters(parameters);
           }
         } catch (err) {
@@ -144,20 +139,22 @@ function App() {
       });
 
       peer.on("signal", async (data: any) => {
-        if (!sessionDocId.current) {
-          // Generate unique 6-digit session code
+        if (data.type === "offer") {
+          // SDP offer — create Firestore session
           let sessionCode = generateSessionCode();
           const sessionsRef = collection(db, "remote_sessions");
-          // Check for collision
           const existing = await getDocs(query(sessionsRef, where("sessionCode", "==", sessionCode), where("status", "==", "waiting")));
           if (!existing.empty) {
             sessionCode = generateSessionCode();
           }
 
-          const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+          const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
           const docRef = await addDoc(sessionsRef, {
             sessionCode,
             offer: JSON.stringify(data),
+            offerCandidates: [],
+            answer: "",
+            answerCandidates: [],
             status: "waiting",
             createdAt: Timestamp.fromDate(new Date()),
             expiresAt: Timestamp.fromDate(expiresAt),
@@ -166,9 +163,8 @@ function App() {
           setCode(sessionCode);
           setStatus("waiting");
           setStatusMessage("상담원의 연결을 대기하고 있습니다...");
-          console.log("✅ Session created:", sessionCode, "Doc ID:", docRef.id);
+          console.log("✅ Session created:", sessionCode);
 
-          // Create audit log
           const logRef = await addDoc(collection(db, "remote_session_logs"), {
             sessionCode,
             sessionDocId: docRef.id,
@@ -181,24 +177,41 @@ function App() {
           });
           logDocId.current = logRef.id;
 
+          // Listen for answer + answerCandidates
           const unsub = onSnapshot(doc(db, "remote_sessions", docRef.id), (snapshot) => {
             const snapData = snapshot.data();
-            console.log("📡 Session update:", snapData?.status, "Has answer:", !!snapData?.answer);
-            if (snapData?.answer && !peer.connected) {
-              console.log("🔗 Signaling answer to peer");
+            if (!snapData) return;
+
+            // Signal answer SDP (once)
+            if (snapData.answer && !answerSignaled) {
+              answerSignaled = true;
+              console.log("🔗 Received answer from admin");
               peer.signal(JSON.parse(snapData.answer));
             }
+
+            // Signal new answer candidates
+            const candidates = snapData.answerCandidates || [];
+            for (let i = processedAnswerCandidates; i < candidates.length; i++) {
+              console.log("🧊 Received answer candidate", i);
+              peer.signal(JSON.parse(candidates[i]));
+            }
+            processedAnswerCandidates = candidates.length;
           });
           unsubRef.current = unsub;
+        } else if (data.candidate && sessionDocId.current) {
+          // ICE candidate — append to offerCandidates
+          console.log("🧊 Sending offer candidate");
+          await updateDoc(doc(db, "remote_sessions", sessionDocId.current), {
+            offerCandidates: arrayUnion(JSON.stringify(data)),
+          }).catch(err => console.error("Failed to send candidate:", err));
         }
       });
 
       peer.on("connect", async () => {
-        console.log("✅ Peer connected!");
         connectedAtRef.current = new Date();
         setStatus("connected");
         setStatusMessage("상담원과 연결되었습니다.");
-        // Update audit log with connection time
+        console.log("✅ Peer connected!");
         if (logDocId.current) {
           try {
             await updateDoc(doc(db, "remote_session_logs", logDocId.current), {
@@ -209,7 +222,7 @@ function App() {
           }
         }
 
-        // Start adaptive bitrate monitoring
+        // Adaptive bitrate monitoring
         const bitrateMonitor = setInterval(async () => {
           try {
             const pc = (peer as any)._pc as RTCPeerConnection;
@@ -231,7 +244,6 @@ function App() {
               }
             });
 
-            // Adjust bitrate based on packet loss
             const senders = pc.getSenders();
             const videoSender = senders.find((s: RTCRtpSender) => s.track?.kind === 'video');
 
@@ -245,13 +257,9 @@ function App() {
               let newBitrate = currentBitrate;
 
               if (packetLoss > 0.05) {
-                // High packet loss (>5%) - decrease bitrate by 20%
                 newBitrate = Math.max(500000, currentBitrate * 0.8);
-                console.log(`High packet loss (${(packetLoss * 100).toFixed(1)}%), reducing bitrate to ${(newBitrate / 1000000).toFixed(1)} Mbps`);
               } else if (packetLoss < 0.01 && currentBitrate < 4000000) {
-                // Low packet loss (<1%) - increase bitrate by 10% up to 4 Mbps
                 newBitrate = Math.min(4000000, currentBitrate * 1.1);
-                console.log(`Low packet loss (${(packetLoss * 100).toFixed(1)}%), increasing bitrate to ${(newBitrate / 1000000).toFixed(1)} Mbps`);
               }
 
               if (newBitrate !== currentBitrate) {
@@ -262,9 +270,8 @@ function App() {
           } catch (err) {
             console.warn("Bitrate monitoring error:", err);
           }
-        }, 3000); // Monitor every 3 seconds
+        }, 3000);
 
-        // Cleanup monitor on disconnect
         peer.once("close", () => clearInterval(bitrateMonitor));
       });
 
@@ -272,7 +279,7 @@ function App() {
         try {
           const parsed = JSON.parse(rawData.toString());
           const command = validateCommand(parsed);
-          if (!command) return; // Invalid or rate-limited
+          if (!command) return;
 
           if (command.type === "mousemove") {
             commandCounts.current.mouseMovements++;
@@ -310,19 +317,48 @@ function App() {
       console.error(err);
       if (err.name === "NotAllowedError") {
         setStatus("idle");
-        setStatusMessage("화면 공유가 취소되었습니다. 다시 시도해주세요.");
+        setStatusMessage("화면 공유가 취소되었습니다. 아래 버튼을 눌러 다시 시도해주세요.");
       } else {
         setStatus("error");
         setStatusMessage("오류 발생: " + String(err));
       }
     }
-  };
+  }, [status, cleanup]);
 
   const copyCode = () => {
     navigator.clipboard.writeText(code);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
+
+  // Auto-start on mount
+  useEffect(() => {
+    if (!autoStarted.current) {
+      autoStarted.current = true;
+      const timer = setTimeout(() => {
+        startShare();
+      }, 500);
+      return () => clearTimeout(timer);
+    }
+  }, []);
+
+  // Listen for deep-link events (when app is already running)
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    onOpenUrl((urls) => {
+      console.log("Deep link received:", urls);
+      if (status === "idle" || status === "ended" || status === "error") {
+        startShare();
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    }).catch((err) => {
+      console.warn("Deep link listener setup failed:", err);
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [status, startShare]);
 
   // Apply stream to video when video element becomes available
   useEffect(() => {
@@ -375,7 +411,7 @@ function App() {
                 <line x1="8" x2="16" y1="21" y2="21" />
                 <line x1="12" x2="12" y1="17" y2="21" />
               </svg>
-              원격 지원 시작
+              화면 공유 시작
             </button>
           ) : status === "error" ? (
             <>
@@ -421,7 +457,7 @@ function App() {
           ) : status === "ended" ? (
             <>
               <div className="ended-message">{statusMessage}</div>
-              <button className="btn-primary" onClick={resetToIdle}>
+              <button className="btn-primary" onClick={startShare}>
                 다시 시작
               </button>
             </>
